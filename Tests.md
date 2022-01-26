@@ -14,6 +14,7 @@ The following command will create an interactive session.  It's important to inc
 
 ## Test dlrm example
 First, change to the dlrm example folder
+
     cd torchrec/torchrec/examples/dlrm
 
 Run the example (change `-j 1x4` to match the number of GPUs, e.g., to `-j1x2` if there are 2 GPUs)
