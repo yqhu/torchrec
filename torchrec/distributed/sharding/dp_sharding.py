@@ -5,21 +5,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import List, Optional, Dict, Any, Tuple, cast
+from typing import List, Optional, Dict, Any, Tuple, cast, TypeVar
 
 import torch
-from torch.distributed._sharding_spec import ShardMetadata
-from torchrec.distributed.embedding_lookup import (
-    GroupedPooledEmbeddingsLookup,
-    GroupedEmbeddingsLookup,
-)
+from torchrec.distributed.embedding_lookup import GroupedPooledEmbeddingsLookup
 from torchrec.distributed.embedding_sharding import (
     EmbeddingSharding,
     group_tables,
-    BasePooledEmbeddingDist,
-    BaseSequenceEmbeddingDist,
+    BaseEmbeddingDist,
     BaseSparseFeaturesDist,
-    SequenceShardingContext,
     BaseEmbeddingLookup,
 )
 from torchrec.distributed.embedding_types import (
@@ -29,87 +23,24 @@ from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     BaseGroupedFeatureProcessor,
 )
-from torchrec.distributed.types import Awaitable, NoWait, ParameterSharding, ShardingEnv
+from torchrec.distributed.types import (
+    Awaitable,
+    NoWait,
+    ParameterSharding,
+    ShardingEnv,
+    ShardMetadata,
+)
 from torchrec.modules.embedding_configs import EmbeddingTableConfig
+from torchrec.streamable import Multistreamable
 
 
-class DpSparseFeaturesDist(BaseSparseFeaturesDist[SparseFeatures]):
+F = TypeVar("F", bound=Multistreamable)
+T = TypeVar("T")
+
+
+class BaseDpTwEmbeddingSharding(EmbeddingSharding[F, T]):
     """
-    Distributes sparse features (input) to be data-parallel.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(
-        self,
-        sparse_features: SparseFeatures,
-    ) -> Awaitable[Awaitable[SparseFeatures]]:
-        """
-        No-op as sparse features are already distributed in data-parallel fashion.
-
-        Call Args:
-            sparse_features (SparseFeatures): input sparse features.
-
-        Returns:
-            Awaitable[Awaitable[SparseFeatures]]: wait twice to get sparse features.
-        """
-
-        return NoWait(cast(Awaitable[SparseFeatures], NoWait(sparse_features)))
-
-
-class DpPooledEmbeddingDist(BasePooledEmbeddingDist[torch.Tensor]):
-    """
-    Distributes pooled embeddings to be data-parallel.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, local_embs: torch.Tensor) -> Awaitable[torch.Tensor]:
-        """
-        No-op as pooled embeddings are already distributed in data-parallel fashion.
-
-        Call Args:
-            local_embs (torch.Tensor): output sequence embeddings.
-
-        Returns:
-            Awaitable[torch.Tensor]: awaitable of pooled embeddings tensor.
-        """
-
-        return NoWait(local_embs)
-
-
-class DpSequenceEmbeddingDist(BaseSequenceEmbeddingDist):
-    """
-    Distributes sequence embeddings to be data-parallel.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(
-        self, sharding_ctx: SequenceShardingContext, local_embs: torch.Tensor
-    ) -> Awaitable[torch.Tensor]:
-        """
-        No-op as sequence embeddings are already distributed in data-parallel fashion.
-
-        Call Args:
-            local_embs (torch.Tensor): output sequence embeddings.
-
-        Returns:
-            Awaitable[torch.Tensor]: awaitable of pooled embeddings tensor.
-        """
-
-        return NoWait(local_embs)
-
-
-class DpEmbeddingSharding(
-    EmbeddingSharding[SparseFeatures, torch.Tensor, SparseFeatures, torch.Tensor]
-):
-    """
-    Shards embedding bags using data-parallel, with no table sharding i.e.. a given
-    embedding table is replicated across all ranks.
+    base class for data-parallel sharding
     """
 
     def __init__(
@@ -119,12 +50,10 @@ class DpEmbeddingSharding(
         ],
         env: ShardingEnv,
         device: Optional[torch.device] = None,
-        is_sequence: bool = False,
     ) -> None:
         super().__init__()
         self._env = env
         self._device = device
-        self._is_sequence = is_sequence
         self._rank: int = self._env.rank
         self._world_size: int = self._env.world_size
         sharded_tables_per_rank = self._shard(embedding_configs)
@@ -179,61 +108,6 @@ class DpEmbeddingSharding(
                 )
         return tables_per_rank
 
-    def create_train_input_dist(self) -> DpSparseFeaturesDist:
-        return DpSparseFeaturesDist()
-
-    def create_train_lookup(
-        self,
-        fused_params: Optional[Dict[str, Any]],
-        feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
-    ) -> BaseEmbeddingLookup:
-        if self._is_sequence:
-            return GroupedEmbeddingsLookup(
-                grouped_configs=self._grouped_embedding_configs,
-                fused_params=fused_params,
-                pg=self._env.process_group,
-                device=self._device,
-            )
-        else:
-            return GroupedPooledEmbeddingsLookup(
-                grouped_configs=self._grouped_embedding_configs,
-                grouped_score_configs=self._score_grouped_embedding_configs,
-                fused_params=fused_params,
-                pg=self._env.process_group,
-                device=self._device,
-                feature_processor=feature_processor,
-            )
-
-    def create_train_pooled_output_dist(
-        self,
-        device: Optional[torch.device] = None,
-    ) -> DpPooledEmbeddingDist:
-        return DpPooledEmbeddingDist()
-
-    def create_train_sequence_output_dist(self) -> DpSequenceEmbeddingDist:
-        return DpSequenceEmbeddingDist()
-
-    def create_infer_input_dist(self) -> DpSparseFeaturesDist:
-        return DpSparseFeaturesDist()
-
-    def create_infer_lookup(
-        self,
-        fused_params: Optional[Dict[str, Any]],
-        feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
-    ) -> BaseEmbeddingLookup[SparseFeatures, torch.Tensor]:
-        return GroupedPooledEmbeddingsLookup(
-            grouped_configs=self._grouped_embedding_configs,
-            grouped_score_configs=self._score_grouped_embedding_configs,
-            fused_params=fused_params,
-            device=self._device,
-        )
-
-    def create_infer_pooled_output_dist(
-        self,
-        device: Optional[torch.device] = None,
-    ) -> DpPooledEmbeddingDist:
-        return DpPooledEmbeddingDist()
-
     def embedding_dims(self) -> List[int]:
         embedding_dims = []
         for grouped_config in self._grouped_embedding_configs:
@@ -269,3 +143,85 @@ class DpEmbeddingSharding(
         for grouped_config in self._score_grouped_embedding_configs:
             id_score_list_feature_names.extend(grouped_config.feature_names())
         return id_score_list_feature_names
+
+
+class DpSparseFeaturesDist(BaseSparseFeaturesDist[SparseFeatures]):
+    """
+    Distributes sparse features (input) to be data-parallel.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(
+        self,
+        sparse_features: SparseFeatures,
+    ) -> Awaitable[Awaitable[SparseFeatures]]:
+        """
+        No-op as sparse features are already distributed in data-parallel fashion.
+
+        Call Args:
+            sparse_features (SparseFeatures): input sparse features.
+
+        Returns:
+            Awaitable[Awaitable[SparseFeatures]]: wait twice to get sparse features.
+        """
+
+        return NoWait(cast(Awaitable[SparseFeatures], NoWait(sparse_features)))
+
+
+class DpPooledEmbeddingDist(BaseEmbeddingDist[torch.Tensor]):
+    """
+    Distributes pooled embeddings to be data-parallel.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, local_embs: torch.Tensor) -> Awaitable[torch.Tensor]:
+        """
+        No-op as pooled embeddings are already distributed in data-parallel fashion.
+
+        Call Args:
+            local_embs (torch.Tensor): output sequence embeddings.
+
+        Returns:
+            Awaitable[torch.Tensor]: awaitable of pooled embeddings tensor.
+        """
+
+        return NoWait(local_embs)
+
+
+class DpPooledEmbeddingSharding(
+    BaseDpTwEmbeddingSharding[SparseFeatures, torch.Tensor]
+):
+    """
+    Shards embedding bags using data-parallel, with no table sharding i.e.. a given
+    embedding table is replicated across all ranks.
+    """
+
+    def create_input_dist(
+        self, device: Optional[torch.device] = None
+    ) -> BaseSparseFeaturesDist[SparseFeatures]:
+        return DpSparseFeaturesDist()
+
+    def create_lookup(
+        self,
+        device: Optional[torch.device] = None,
+        fused_params: Optional[Dict[str, Any]] = None,
+        feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
+    ) -> BaseEmbeddingLookup:
+        return GroupedPooledEmbeddingsLookup(
+            grouped_configs=self._grouped_embedding_configs,
+            grouped_score_configs=self._score_grouped_embedding_configs,
+            fused_params=fused_params,
+            pg=self._env.process_group,
+            device=device if device is not None else self._device,
+            feature_processor=feature_processor,
+        )
+
+    def create_output_dist(
+        self,
+        device: Optional[torch.device] = None,
+    ) -> BaseEmbeddingDist[torch.Tensor]:
+        return DpPooledEmbeddingDist()

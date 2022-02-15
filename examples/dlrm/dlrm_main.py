@@ -21,11 +21,12 @@ from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
 from torchrec.datasets.utils import Batch
 from torchrec.distributed import TrainPipelineSparseDist
 from torchrec.distributed.model_parallel import DistributedModelParallel
-from torchrec.examples.dlrm.data.dlrm_dataloader import get_dataloader, STAGES
-from torchrec.examples.dlrm.modules.dlrm_train import DLRMTrain
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 from tqdm import tqdm
+
+from .data.dlrm_dataloader import get_dataloader, STAGES
+from .modules.dlrm_train import DLRMTrain
 
 TRAIN_PIPELINE_STAGES = 3  # Number of stages in TrainPipelineSparseDist.
 
@@ -131,6 +132,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         type=float,
         default=15.0,
         help="Learning rate.",
+    )
+    parser.add_argument(
+        "--shuffle_batches",
+        type=bool,
+        default=False,
+        help="Shuffle each batch during training.",
     )
     parser.set_defaults(pin_memory=None)
     return parser.parse_args(argv)

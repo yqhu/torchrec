@@ -21,12 +21,15 @@ jobs:
          - os: linux.2xlarge
            python-version: 3.7
            python-tag: "py37"
+           cuda-tag: "cu11"
          - os: linux.2xlarge
            python-version: 3.8
            python-tag: "py38"
+           cuda-tag: "cu11"
          - os: linux.2xlarge
            python-version: 3.9
            python-tag: "py39"
+           cuda-tag: "cu11"
     steps:
     # Checkout the repository to the GitHub Actions runner
     - name: Check ldd --version
@@ -108,13 +111,13 @@ jobs:
         rm -r dist || true
         conda run -n build_binary \
           python setup.py bdist_wheel \
-          --pacakge_name torchrec-nightly \
+          --package_name torchrec-nightly \
           --TORCH_CUDA_ARCH_LIST "'7.0;8.0'" \
           --python-tag=${{ matrix.python-tag }}
     - name: Upload wheel as GHA artifact
       uses: actions/upload-artifact@v2
       with:
-        name: torchrec_nightly_${{ matrix.python-version }}.whl
+        name: torchrec_nightly_${{ matrix.python-version }}_${{ matrix.cuda-tag }}.whl
         path: dist/torchrec_nightly-*.whl
 
   # download from GHA, test on gpu and push to pypi
@@ -124,6 +127,7 @@ jobs:
       matrix:
         os: [linux.4xlarge.nvidia.gpu]
         python-version: [3.7, 3.8, 3.9]
+        cuda-tag: ["cu11"]
     needs: build_on_cpu
     # the glibc version should match the version of the one we used to build the binary
     # for this case, it's 2.26
@@ -219,7 +223,7 @@ jobs:
     - name: Download wheel
       uses: actions/download-artifact@v2
       with:
-        name: torchrec_nightly_${{ matrix.python-version }}.whl
+        name: torchrec_nightly_${{ matrix.python-version }}_${{ matrix.cuda-tag }}.whl
     - name: Display structure of downloaded files
       run: ls -R
     - name: Install TorchRec Nightly
@@ -234,14 +238,11 @@ jobs:
         conda run -n build_binary \
           python -c "import torchrec"
     - name: Test with pytest
-      # remove this line when we fixed all the unit tests
-      continue-on-error: true
       run: |
         conda run -n build_binary \
           python -m pip install pytest
-        cd torchrec
         conda run -n build_binary \
-          python -m pytest -v -s -W ignore::pytest.PytestCollectionWarning --continue-on-collection-errors
+          python -m pytest torchrec -v -s -W ignore::pytest.PytestCollectionWarning --continue-on-collection-errors
     # Push to Pypi
     - name: Push TorchRec Binary to PYPI
       env:

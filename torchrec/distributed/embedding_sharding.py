@@ -6,13 +6,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import abc
-from dataclasses import dataclass, field
 from typing import TypeVar, Generic, List, Tuple, Optional, Dict, Any
 
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed._sharding_spec import ShardMetadata
 from torchrec.distributed.dist_data import (
     KJTAllToAll,
     KJTOneToAll,
@@ -28,42 +26,13 @@ from torchrec.distributed.embedding_types import (
     SparseFeaturesList,
     ListOfSparseFeaturesList,
 )
-from torchrec.distributed.types import NoWait, Awaitable
+from torchrec.distributed.types import NoWait, Awaitable, ShardMetadata
 from torchrec.modules.embedding_configs import (
     PoolingType,
     DataType,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
-
-
-@dataclass
-class SequenceShardingContext(Multistreamable):
-    """
-    SequenceEmbeddingAllToAll has the same comm pattern as KJTAllToAll.
-    Stores KJTAllToAll context and reuses it in SequenceEmbeddingAllToAll.
-
-    features_before_input_dist: stores the original KJT before input dist.
-    input_splits: stores the input splits of KJT AlltoAll.
-    output_splits: stores the output splits of KJT AlltoAll.
-    unbucketize_permute_tensor: stores the permute order of
-        KJT bucketize (for row-wise sharding only).
-    lengths_after_input_dist: stores the KJT length after input dist.
-    """
-
-    features_before_input_dist: Optional[KeyedJaggedTensor] = None
-    input_splits: List[int] = field(default_factory=list)
-    output_splits: List[int] = field(default_factory=list)
-    unbucketize_permute_tensor: Optional[torch.Tensor] = None
-    lengths_after_input_dist: Optional[torch.Tensor] = None
-
-    def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
-        if self.features_before_input_dist is not None:
-            self.features_before_input_dist.record_stream(stream)
-        if self.unbucketize_permute_tensor is not None:
-            self.unbucketize_permute_tensor.record_stream(stream)
-        if self.lengths_after_input_dist is not None:
-            self.lengths_after_input_dist.record_stream(stream)
 
 
 class SparseFeaturesIndices(Awaitable[SparseFeatures]):
@@ -505,14 +474,6 @@ def group_tables(
     )
 
 
-F = TypeVar("F", bound=Multistreamable)
-T = TypeVar("T")
-TRAIN_F = TypeVar("TRAIN_F", bound=Multistreamable)
-INFER_F = TypeVar("INFER_F", bound=Multistreamable)
-TRAIN_T = TypeVar("TRAIN_T")
-INFER_T = TypeVar("INFER_T")
-
-
 class SparseFeaturesListAwaitable(Awaitable[SparseFeaturesList]):
     """
     Awaitable of SparseFeaturesList.
@@ -595,6 +556,10 @@ class ListOfSparseFeaturesListAwaitable(Awaitable[ListOfSparseFeaturesList]):
         return ListOfSparseFeaturesList([w.wait() for w in self.awaitables])
 
 
+F = TypeVar("F", bound=Multistreamable)
+T = TypeVar("T")
+
+
 class BaseSparseFeaturesDist(abc.ABC, nn.Module, Generic[F]):
     """
     Converts input from data-parallel to model-parallel.
@@ -608,77 +573,47 @@ class BaseSparseFeaturesDist(abc.ABC, nn.Module, Generic[F]):
         pass
 
 
-class BasePooledEmbeddingDist(abc.ABC, nn.Module, Generic[T]):
+class BaseEmbeddingDist(abc.ABC, nn.Module, Generic[T]):
     """
-    Converts output of pooled EmbeddingLookup from model-parallel to data-parallel.
+    Converts output of EmbeddingLookup from model-parallel to data-parallel.
     """
-
-    @abc.abstractmethod
-    def forward(self, local_embs: T) -> Awaitable[torch.Tensor]:
-        pass
-
-
-class BaseSequenceEmbeddingDist(abc.ABC, nn.Module):
-    """
-    Converts output of sequence EmbeddingLookup from model-parallel to data-parallel.
-    """
-
-    pass
 
     @abc.abstractmethod
     def forward(
-        self, sharding_ctx: SequenceShardingContext, local_embs: torch.Tensor
+        self,
+        local_embs: T,
     ) -> Awaitable[torch.Tensor]:
         pass
 
 
-class EmbeddingSharding(abc.ABC, Generic[TRAIN_F, TRAIN_T, INFER_F, INFER_T]):
+class EmbeddingSharding(abc.ABC, Generic[F, T]):
     """
     Used to implement different sharding types for EmbeddingBagCollection, e.g.
     table_wise.
     """
 
-    def __init__(self, permute_embeddings: bool = False) -> None:
-        self._permute_embeddings: bool = permute_embeddings
-
     @abc.abstractmethod
-    def create_train_input_dist(self) -> BaseSparseFeaturesDist[TRAIN_F]:
-        pass
-
-    @abc.abstractmethod
-    def create_train_pooled_output_dist(
+    def create_input_dist(
         self,
         device: Optional[torch.device] = None,
-    ) -> BasePooledEmbeddingDist[TRAIN_T]:
+    ) -> BaseSparseFeaturesDist[F]:
         pass
 
     @abc.abstractmethod
-    def create_train_sequence_output_dist(self) -> BaseSequenceEmbeddingDist:
-        pass
-
-    @abc.abstractmethod
-    def create_train_lookup(
-        self,
-        fused_params: Optional[Dict[str, Any]],
-        feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
-    ) -> BaseEmbeddingLookup[TRAIN_F, TRAIN_T]:
-        pass
-
-    def create_infer_input_dist(self) -> BaseSparseFeaturesDist[INFER_F]:
-        raise NotImplementedError
-
-    def create_infer_pooled_output_dist(
+    def create_output_dist(
         self,
         device: Optional[torch.device] = None,
-    ) -> BasePooledEmbeddingDist[INFER_T]:
-        raise NotImplementedError
+    ) -> BaseEmbeddingDist[T]:
+        pass
 
-    def create_infer_lookup(
+    @abc.abstractmethod
+    def create_lookup(
         self,
-        fused_params: Optional[Dict[str, Any]],
+        device: Optional[torch.device] = None,
+        fused_params: Optional[Dict[str, Any]] = None,
         feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
-    ) -> BaseEmbeddingLookup[INFER_F, INFER_T]:
-        raise NotImplementedError
+    ) -> BaseEmbeddingLookup[F, T]:
+        pass
 
     @abc.abstractmethod
     def embedding_dims(self) -> List[int]:

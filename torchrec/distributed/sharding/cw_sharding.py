@@ -5,16 +5,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Set, Callable, Dict, List, Optional, Tuple
+from typing import Set, Callable, Dict, List, Optional, Tuple, TypeVar, Any
 
 import torch
 import torch.distributed as dist  # noqa
 from fbgemm_gpu.permute_pooled_embedding_modules import PermutePooledEmbeddings
+from torchrec.distributed.embedding_lookup import GroupedPooledEmbeddingsLookup
+from torchrec.distributed.embedding_sharding import (
+    BaseEmbeddingDist,
+    BaseSparseFeaturesDist,
+    BaseEmbeddingLookup,
+)
 from torchrec.distributed.embedding_types import (
     ShardedEmbeddingTable,
     EmbeddingComputeKernel,
+    SparseFeatures,
+    BaseGroupedFeatureProcessor,
 )
-from torchrec.distributed.tw_sharding import TwEmbeddingSharding, TwPooledEmbeddingDist
+from torchrec.distributed.sharding.tw_sharding import (
+    BaseTwEmbeddingSharding,
+    TwPooledEmbeddingDist,
+    TwSparseFeaturesDist,
+)
 from torchrec.distributed.types import (
     ShardingEnv,
     ShardedTensorMetadata,
@@ -22,12 +34,15 @@ from torchrec.distributed.types import (
     ParameterSharding,
 )
 from torchrec.modules.embedding_configs import EmbeddingTableConfig
+from torchrec.streamable import Multistreamable
+
+F = TypeVar("F", bound=Multistreamable)
+T = TypeVar("T")
 
 
-class CwEmbeddingSharding(TwEmbeddingSharding):
+class BaseCwEmbeddingSharding(BaseTwEmbeddingSharding[F, T]):
     """
-    Shards embedding bags column-wise, i.e.. a given embedding table is distributed by
-    specified number of columns and table slices are placed on all ranks.
+    base class for column-wise sharding
     """
 
     def __init__(
@@ -40,8 +55,11 @@ class CwEmbeddingSharding(TwEmbeddingSharding):
         permute_embeddings: bool = False,
     ) -> None:
         super().__init__(
-            embedding_configs, env, device, permute_embeddings=permute_embeddings
+            embedding_configs,
+            env,
+            device,
         )
+        self._permute_embeddings = permute_embeddings
         if self._permute_embeddings:
             self._init_combined_embeddings()
 
@@ -162,10 +180,44 @@ class CwEmbeddingSharding(TwEmbeddingSharding):
             else super().embedding_names()
         )
 
-    def create_train_pooled_output_dist(
+
+class CwPooledEmbeddingSharding(BaseCwEmbeddingSharding[SparseFeatures, torch.Tensor]):
+    """
+    Shards embedding bags column-wise, i.e.. a given embedding table is entirely placed
+    on a selected rank.
+    """
+
+    def create_input_dist(
         self,
         device: Optional[torch.device] = None,
-    ) -> TwPooledEmbeddingDist:
+    ) -> BaseSparseFeaturesDist[SparseFeatures]:
+        return TwSparseFeaturesDist(
+            self._pg,
+            self._id_list_features_per_rank(),
+            self._id_score_list_features_per_rank(),
+            device if device is not None else self._device,
+        )
+
+    def create_lookup(
+        self,
+        device: Optional[torch.device] = None,
+        fused_params: Optional[Dict[str, Any]] = None,
+        feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
+    ) -> BaseEmbeddingLookup:
+        return GroupedPooledEmbeddingsLookup(
+            grouped_configs=self._grouped_embedding_configs,
+            grouped_score_configs=self._score_grouped_embedding_configs,
+            fused_params=fused_params,
+            pg=self._pg,
+            device=device if device is not None else self._device,
+            feature_processor=feature_processor,
+        )
+
+    def create_output_dist(
+        self,
+        device: Optional[torch.device] = None,
+    ) -> BaseEmbeddingDist[torch.Tensor]:
+        device = device if device is not None else self._device
         embedding_permute_op: Optional[PermutePooledEmbeddings] = None
         callbacks: Optional[List[Callable[[torch.Tensor], torch.Tensor]]] = None
         if self._permute_embeddings and self._embedding_order != list(
@@ -175,8 +227,8 @@ class CwEmbeddingSharding(TwEmbeddingSharding):
             embedding_permute_op = PermutePooledEmbeddings(
                 self._embedding_dims,
                 self._embedding_order,
-            ).to(device=self._device)
+            ).to(device=device)
             callbacks = [embedding_permute_op]
         return TwPooledEmbeddingDist(
-            self._pg, self._dim_sum_per_rank(), self._device, callbacks
+            self._pg, self._dim_sum_per_rank(), device, callbacks
         )

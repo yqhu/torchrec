@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import time
 from typing import (
     Iterator,
     Any,
@@ -33,9 +34,10 @@ from torchrec.datasets.utils import (
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-
+FREQUENCY_THRESHOLD = 3
 INT_FEATURE_COUNT = 13
 CAT_FEATURE_COUNT = 26
+DAYS = 24
 DEFAULT_LABEL_NAME = "label"
 DEFAULT_INT_NAMES: List[str] = [f"int_{idx}" for idx in range(INT_FEATURE_COUNT)]
 DEFAULT_CAT_NAMES: List[str] = [f"cat_{idx}" for idx in range(CAT_FEATURE_COUNT)]
@@ -375,6 +377,253 @@ class BinaryCriteoUtils:
             data = np.fromfile(fin, dtype=dtype, count=num_entries)
             return data.reshape((num_rows, row_size))
 
+    @staticmethod
+    def sparse_to_contiguous(
+        in_files: List[str],
+        output_dir: str,
+        frequency_threshold: int = FREQUENCY_THRESHOLD,
+        columns: int = CAT_FEATURE_COUNT,
+        path_manager_key: str = PATH_MANAGER_KEY,
+        output_file_suffix: str = "_contig_freq.npy",
+    ) -> None:
+        """
+        Convert all sparse .npy files to have contiguous integers. Store in a separate
+        .npy file. All input files must be processed together because columns
+        can have matching IDs between files. Hence, they must be transformed
+        together. Also, the transformed IDs are not unique between columns. IDs
+        that appear less than frequency_threshold amount of times will be remapped
+        to have a value of 1.
+
+        Example transformation, frequenchy_threshold of 2:
+        day_0_sparse.npy
+        | col_0 | col_1 |
+        -----------------
+        | abc   | xyz   |
+        | iop   | xyz   |
+
+        day_1_sparse.npy
+        | col_0 | col_1 |
+        -----------------
+        | iop   | tuv   |
+        | lkj   | xyz   |
+
+        day_0_sparse_contig.npy
+        | col_0 | col_1 |
+        -----------------
+        | 1     | 2     |
+        | 2     | 2     |
+
+        day_1_sparse_contig.npy
+        | col_0 | col_1 |
+        -----------------
+        | 2     | 1     |
+        | 1     | 2     |
+
+        Args:
+            in_files List[str]: Input directory of npy files.
+            out_dir (str): Output directory of processed npy files.
+            frequency_threshold: IDs occuring less than this frequency will be remapped to a value of 1.
+            path_manager_key (str): Path manager key used to load from different filesystems.
+
+        Returns:
+            None.
+        """
+
+        # Load each .npy file of sparse features. Transformations are made along the columns.
+        # Thereby, transpose the input to ease operations.
+        # E.g. file_to_features = {"day_0_sparse": [array([[3,6,7],[7,9,3]]}
+        file_to_features: Dict[str, np.ndarray] = {}
+        for f in in_files:
+            name = os.path.basename(f).split(".")[0]
+            file_to_features[name] = np.load(f).transpose()
+            print(f"Successfully loaded file: {f}")
+
+        # Iterate through each column in each file and map the sparse ids to contiguous ids.
+        for col in range(columns):
+            print(f"Processing column: {col}")
+
+            # Iterate through each row in each file for the current column and determine the
+            # frequency of each sparse id.
+            sparse_to_frequency: Dict[int, int] = {}
+            if frequency_threshold > 1:
+                for f in file_to_features:
+                    for _, sparse in enumerate(file_to_features[f][col]):
+                        if sparse in sparse_to_frequency:
+                            sparse_to_frequency[sparse] += 1
+                        else:
+                            sparse_to_frequency[sparse] = 1
+
+            # Iterate through each row in each file for the current column and remap each
+            # sparse id to a contiguous id. The contiguous ints start at a value of 2 so that
+            # infrequenct IDs (determined by the frequency_threshold) can be remapped to 1.
+            running_sum = 2
+            sparse_to_contiguous_int: Dict[int, int] = {}
+
+            for f in file_to_features:
+                print(f"Processing file: {f}")
+
+                for i, sparse in enumerate(file_to_features[f][col]):
+                    if sparse not in sparse_to_contiguous_int:
+                        # If the ID appears less than frequency_threshold amount of times
+                        # remap the value to 1.
+                        if (
+                            frequency_threshold > 1
+                            and sparse_to_frequency[sparse] < frequency_threshold
+                        ):
+                            sparse_to_contiguous_int[sparse] = 1
+                        else:
+                            sparse_to_contiguous_int[sparse] = running_sum
+                            running_sum += 1
+
+                    # Re-map sparse value to contiguous in place.
+                    file_to_features[f][col][i] = sparse_to_contiguous_int[sparse]
+
+        path_manager = PathManagerFactory().get(path_manager_key)
+        for f, features in file_to_features.items():
+            output_file = os.path.join(output_dir, f + output_file_suffix)
+            with path_manager.open(output_file, "wb") as fout:
+                print(f"Writing file: {output_file}")
+                # Transpose back the features when saving, as they were transposed when loading.
+                np.save(fout, features.transpose())
+
+    @staticmethod
+    def shuffle(
+        input_dir_labels_and_dense: str,
+        input_dir_sparse: str,
+        output_dir_shuffled: str,
+        rows_per_day: Dict[int, int],
+        output_dir_full_set: Optional[str] = None,
+        days: int = DAYS,
+        int_columns: int = INT_FEATURE_COUNT,
+        sparse_columns: int = CAT_FEATURE_COUNT,
+        path_manager_key: str = PATH_MANAGER_KEY,
+    ) -> None:
+        """
+        Shuffle the dataset. Expects the files to be in .npy format and the data
+        to be split by day and by dense, sparse and label data.
+        Dense data must be in: day_x_dense.npy
+        Sparse data must be in: day_x_sparse.npy
+        Labels data must be in: day_x_labels.npy
+
+        The dataset will be reconstructed, shuffled and then split back into
+        separate dense, sparse and labels files.
+
+        Args:
+            input_dir_labels_and_dense (str): Input directory of labels and dense npy files.
+            input_dir_sparse (str): Input directory of sparse npy files.
+            output_dir_shuffled (str): Output directory for shuffled labels, dense and sparse npy files.
+            rows_per_day Dict[int, int]: Number of rows in each file.
+            output_dir_full_set (str): Output directory of the full dataset, if desired.
+            days (int): Number of day files.
+            int_columns (int): Number of columns with dense features.
+            columns (int): Total number of columns.
+            path_manager_key (str): Path manager key used to load from different filesystems.
+        """
+
+        total_rows = sum(rows_per_day.values())
+        columns = int_columns + sparse_columns + 1  # add 1 for label column
+        full_dataset = np.zeros((total_rows, columns), dtype=np.float32)
+        curr_first_row = 0
+        curr_last_row = 0
+        for d in range(0, days):
+            curr_last_row += rows_per_day[d]
+
+            # dense
+            path_to_file = os.path.join(
+                input_dir_labels_and_dense, f"day_{d}_dense.npy"
+            )
+            data = np.load(path_to_file)
+            print(
+                f"Day {d} dense- {curr_first_row}-{curr_last_row} loaded files - {time.time()} - {path_to_file}"
+            )
+
+            full_dataset[curr_first_row:curr_last_row, 0:int_columns] = data
+            del data
+
+            # sparse
+            path_to_file = os.path.join(input_dir_sparse, f"day_{d}_sparse.npy")
+            data = np.load(path_to_file)
+            print(
+                f"Day {d} sparse- {curr_first_row}-{curr_last_row} loaded files - {time.time()} - {path_to_file}"
+            )
+
+            full_dataset[curr_first_row:curr_last_row, int_columns : columns - 1] = data
+            del data
+
+            # labels
+            path_to_file = os.path.join(
+                input_dir_labels_and_dense, f"day_{d}_labels.npy"
+            )
+            data = np.load(path_to_file)
+            print(
+                f"Day {d} labels- {curr_first_row}-{curr_last_row} loaded files - {time.time()} - {path_to_file}"
+            )
+
+            full_dataset[curr_first_row:curr_last_row, columns - 1 :] = data
+            del data
+
+            curr_first_row = curr_last_row
+
+        path_manager = PathManagerFactory().get(path_manager_key)
+
+        # Save the full dataset
+        if output_dir_full_set is not None:
+            full_output_file = os.path.join(output_dir_full_set, "full.npy")
+            with path_manager.open(full_output_file, "wb") as fout:
+                print(f"Writing full set file: {full_output_file}")
+                np.save(fout, full_dataset)
+
+        print("Shuffling dataset")
+        np.random.shuffle(full_dataset)
+
+        # Slice and save each portion into dense, sparse and labels
+        curr_first_row = 0
+        curr_last_row = 0
+        for d in range(0, days):
+            curr_last_row += rows_per_day[d]
+
+            # write dense columns
+            shuffled_dense_file = os.path.join(
+                output_dir_shuffled, f"day_{d}_dense.npy"
+            )
+            with path_manager.open(shuffled_dense_file, "wb") as fout:
+                print(
+                    f"Writing rows {curr_first_row}-{curr_last_row-1} dense file: {shuffled_dense_file}"
+                )
+                np.save(fout, full_dataset[curr_first_row:curr_last_row, 0:int_columns])
+
+            # write sparse columns
+            shuffled_sparse_file = os.path.join(
+                output_dir_shuffled, f"day_{d}_sparse.npy"
+            )
+            with path_manager.open(shuffled_sparse_file, "wb") as fout:
+                print(
+                    f"Writing rows {curr_first_row}-{curr_last_row-1} sparse file: {shuffled_sparse_file}"
+                )
+                np.save(
+                    fout,
+                    full_dataset[
+                        curr_first_row:curr_last_row, int_columns : columns - 1
+                    ].astype(np.int32),
+                )
+
+            # write labels columns
+            shuffled_labels_file = os.path.join(
+                output_dir_shuffled, f"day_{d}_labels.npy"
+            )
+            with path_manager.open(shuffled_labels_file, "wb") as fout:
+                print(
+                    f"Writing rows {curr_first_row}-{curr_last_row-1} labels file: {shuffled_labels_file}"
+                )
+                np.save(
+                    fout,
+                    full_dataset[curr_first_row:curr_last_row, columns - 1 :].astype(
+                        np.int32
+                    ),
+                )
+
+            curr_first_row = curr_last_row
+
 
 class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
     """
@@ -392,6 +641,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         batch_size (int): batch size.
         rank (int): rank.
         world_size (int): world size.
+        shuffle_batches (bool): Whether to shuffle batches
         hashes (Optional[int]): List of max categorical feature value for each feature.
             Length of this list should be CAT_FEATURE_COUNT.
         path_manager_key (str): Path manager key used to load from different
@@ -418,6 +668,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         batch_size: int,
         rank: int,
         world_size: int,
+        shuffle_batches: bool = False,
         hashes: Optional[List[int]] = None,
         path_manager_key: str = PATH_MANAGER_KEY,
     ) -> None:
@@ -427,6 +678,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         self.batch_size = batch_size
         self.rank = rank
         self.world_size = world_size
+        self.shuffle_batches = shuffle_batches
         self.hashes = hashes
         self.path_manager_key = path_manager_key
         self.path_manager: PathManager = PathManagerFactory().get(path_manager_key)
@@ -490,6 +742,13 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
     def _np_arrays_to_batch(
         self, dense: np.ndarray, sparse: np.ndarray, labels: np.ndarray
     ) -> Batch:
+        if self.shuffle_batches:
+            # Shuffle all 3 in unison
+            shuffler = np.random.permutation(len(dense))
+            dense = dense[shuffler]
+            sparse = sparse[shuffler]
+            labels = labels[shuffler]
+
         return Batch(
             dense_features=torch.from_numpy(dense),
             sparse_features=KeyedJaggedTensor(

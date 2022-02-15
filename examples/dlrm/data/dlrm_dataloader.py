@@ -15,12 +15,12 @@ from torchrec.datasets.criteo import (
     CAT_FEATURE_COUNT,
     DEFAULT_CAT_NAMES,
     DEFAULT_INT_NAMES,
+    DAYS,
     InMemoryBinaryCriteoIterDataPipe,
 )
 from torchrec.datasets.random import RandomRecDataset
 
 STAGES = ["train", "val", "test"]
-DAYS = 24
 
 
 def _get_random_dataloader(
@@ -85,6 +85,7 @@ def _get_in_memory_dataloader(
             batch_size=args.batch_size,
             rank=rank,
             world_size=world_size,
+            shuffle_batches=args.shuffle_batches,
             hashes=args.num_embeddings_per_feature
             if args.num_embeddings is None
             else ([args.num_embeddings] * CAT_FEATURE_COUNT),
