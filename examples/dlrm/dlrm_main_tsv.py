@@ -354,6 +354,8 @@ def main(argv: List[str]) -> None:
     val_dataloader = get_dataloader(args, backend, "val")
     test_dataloader = get_dataloader(args, backend, "test")
 
+    # return
+
     # Sets default limits for random dataloader iterations when left unspecified.
     if args.in_memory_binary_criteo_path is None:
         for stage in STAGES:

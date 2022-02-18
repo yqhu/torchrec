@@ -683,7 +683,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         self.path_manager_key = path_manager_key
         self.path_manager: PathManager = PathManagerFactory().get(path_manager_key)
 
-        # self._load_data_for_rank()
+        self._load_data_for_rank()
         self.num_rows_per_file: List[int] = [a.shape[0] for a in self.dense_arrs]
         self.num_batches: int = sum(self.num_rows_per_file) // batch_size
 
@@ -711,7 +711,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         print('stride:', self.stride)
         print('length_per_key:', self.length_per_key)
         print('offset_per_key:', self.offset_per_key)
-        print('index_per_key:', self.index_per_key)
+        print('index_per_key:', self.index_per_key)        
 
     def _load_data_for_rank(self) -> None:
         file_idx_to_row_range = BinaryCriteoUtils.get_file_idx_to_row_range(
@@ -906,6 +906,12 @@ class TSVCriteoIterDataPipe(IterableDataset):
         self.index_per_key: Dict[str, int] = {
             key: i for (i, key) in enumerate(self.keys)
         }
+        print('_num_ids_in_batch:', self._num_ids_in_batch)
+        print('keys:', self.keys)
+        print('stride:', self.stride)
+        print('length_per_key:', self.length_per_key)
+        print('offset_per_key:', self.offset_per_key)
+        print('index_per_key:', self.index_per_key)   
 
     # def _load_data_for_rank(self) -> None:
     #     file_idx_to_row_range = BinaryCriteoUtils.get_file_idx_to_row_range(
@@ -949,12 +955,20 @@ class TSVCriteoIterDataPipe(IterableDataset):
         #     sparse = sparse[shuffler]
         #     labels = labels[shuffler]
 
+        dense = [batch[k] for k in DEFAULT_INT_NAMES]
+        dense = torch.concat(dense, 0).view(-1, len(DEFAULT_INT_NAMES))
+        dense = torch.log(dense + 3).to(torch.float32)
+
+        sparse = [[int(i, base=16) if i else 0 for i in batch[k]] for k in DEFAULT_CAT_NAMES]
+        sparse = torch.asarray(sparse) * 0
+        # sparse = sparse.to(torch.int64)
+
         return Batch(
-            dense_features=torch.from_numpy(dense),
+            dense_features=dense,
             sparse_features=KeyedJaggedTensor(
                 keys=self.keys,
                 # transpose + reshape(-1) incurs an additional copy.
-                values=torch.from_numpy(sparse.transpose(1, 0).reshape(-1)),
+                values=sparse.reshape(-1),
                 lengths=self.lengths,
                 offsets=self.offsets,
                 stride=self.stride,
@@ -962,8 +976,24 @@ class TSVCriteoIterDataPipe(IterableDataset):
                 offset_per_key=self.offset_per_key,
                 index_per_key=self.index_per_key,
             ),
-            labels=torch.from_numpy(labels.reshape(-1)),
+            labels=batch['label'],
         )
+
+        # return Batch(
+        #     dense_features=torch.from_numpy(dense),
+        #     sparse_features=KeyedJaggedTensor(
+        #         keys=self.keys,
+        #         # transpose + reshape(-1) incurs an additional copy.
+        #         values=torch.from_numpy(sparse.transpose(1, 0).reshape(-1)),
+        #         lengths=self.lengths,
+        #         offsets=self.offsets,
+        #         stride=self.stride,
+        #         length_per_key=self.length_per_key,
+        #         offset_per_key=self.offset_per_key,
+        #         index_per_key=self.index_per_key,
+        #     ),
+        #     labels=torch.from_numpy(labels.reshape(-1)),
+        # )
 
     def __iter__(self) -> Iterator[Batch]:
         batch = next(self.datapipe)

@@ -11,12 +11,15 @@ from typing import List
 
 from torch import distributed as dist
 from torch.utils.data import DataLoader
+import torch.utils.data.datapipes as dp
 from torchrec.datasets.criteo import (
     CAT_FEATURE_COUNT,
     DEFAULT_CAT_NAMES,
     DEFAULT_INT_NAMES,
     DAYS,
     InMemoryBinaryCriteoIterDataPipe,
+    TSVCriteoIterDataPipe,
+    criteo_terabyte
 )
 from torchrec.datasets.random import RandomRecDataset
 
@@ -97,6 +100,66 @@ def _get_in_memory_dataloader(
     return dataloader
 
 
+def _get_tsv_dataloader(
+    args: argparse.Namespace,
+    stage: str,
+    pin_memory: bool,
+) -> DataLoader:
+    files = os.listdir(args.in_memory_binary_criteo_path)
+
+    def is_final_day(s: str) -> bool:
+        return f"day_{DAYS - 1}" in s
+
+    if stage == "train":
+        # Train set gets all data except from the final day.
+        files = list(filter(lambda s: not is_final_day(s), files))
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        # Validation set gets the first half of the final day's samples. Test set get
+        # the other half.
+        files = list(filter(is_final_day, files))
+        rank = (
+            dist.get_rank()
+            if stage == "val"
+            else dist.get_rank() + dist.get_world_size()
+        )
+        world_size = dist.get_world_size() * 2
+
+    stage_files: List[List[str]] = sorted(os.path.join(args.in_memory_binary_criteo_path, x) for x in files)
+    
+    print(stage, 'stage_files:', stage_files)
+    # # return
+
+    # datapipe = criteo_terabyte(stage_files)
+    # # datapipe = dp.iter.Batcher(datapipe, args.batch_size)
+    # # datapipe = dp.iter.Collator(datapipe)
+
+    # dataloader = DataLoader(
+    #     datapipe,
+    #     batch_size=None,
+    #     pin_memory=pin_memory,
+    #     #collate_fn=lambda x: x,
+    # )
+
+    dataloader = DataLoader(
+        TSVCriteoIterDataPipe(
+            stage_files,  # pyre-ignore[6]
+            batch_size=args.batch_size,
+            rank=rank,
+            world_size=world_size,
+            shuffle_batches=args.shuffle_batches,
+            hashes=args.num_embeddings_per_feature
+            if args.num_embeddings is None
+            else ([args.num_embeddings] * CAT_FEATURE_COUNT),
+        ),
+        batch_size=None,
+        pin_memory=pin_memory,
+        collate_fn=lambda x: x,
+    )
+    return dataloader
+
+
 def get_dataloader(args: argparse.Namespace, backend: str, stage: str) -> DataLoader:
     """
     Gets desired dataloader from dlrm_main command line options. Currently, this
@@ -122,4 +185,5 @@ def get_dataloader(args: argparse.Namespace, backend: str, stage: str) -> DataLo
     if args.in_memory_binary_criteo_path is None:
         return _get_random_dataloader(args, pin_memory)
     else:
-        return _get_in_memory_dataloader(args, stage, pin_memory)
+        # return _get_in_memory_dataloader(args, stage, pin_memory)
+        return _get_tsv_dataloader(args, stage, pin_memory)
